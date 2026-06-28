@@ -1,0 +1,10 @@
+sentence-transformers
+ollama
+faiss-cpu
+datasets
+matplotlib
+pandas
+openpyxl
+keras
+gradio 
+keras-hub @ git+https://github.com/keras-team/keras-hub.git

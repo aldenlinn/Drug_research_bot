@@ -1,0 +1,31 @@
+# Secrets / environment - NEVER commit
+.env
+.env.*
+*.key
+*.pem
+secrets.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Model weights / adapters (too big for git, regenerate from training)
+gemma-4-12b-drugbot-lora/
+*.safetensors
+*.npz
+
+# Embeddings / FAISS index (regenerate from corpus)
+rag_index/
+harvest_vectors.npy
+
+# Logs / HF cache / TB runs
+*.log
+.cache/
+runs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
