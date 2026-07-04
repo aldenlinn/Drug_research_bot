@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import os
+import sys
+
+# Serving is launched from the Drug_research_bot repo root, which contains a from-source
+# `bitsandbytes/` checkout. That directory shadows the installed package as a hollow namespace
+# (no `.nn`), so when PEFT attaches the LoRA adapter it calls is_bnb_4bit_available() ->
+# `bnb.nn.Linear4bit` and dies with AttributeError, even though this serve is pure bf16. Pre-import
+# the REAL bitsandbytes with the shadow entries temporarily off sys.path so it caches in sys.modules,
+# then restore sys.path so the local modules (rag_retriever, drugbot_prompts, ie_client) still import.
+# Once cached, the later `import bitsandbytes` inside transformers/peft returns the real module.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_saved_sys_path = sys.path[:]
+sys.path[:] = [p for p in sys.path if p not in ("", ".", os.getcwd(), _HERE)]
+try:
+    import bitsandbytes  # noqa: F401 -- resolve to the real install and cache it before peft imports it
+except Exception:  # noqa: BLE001 -- if bnb is genuinely absent, peft will surface it at adapter time
+    pass
+finally:
+    sys.path[:] = _saved_sys_path
+
+import copy
+import hmac
+import logging
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Sequence
+
+import torch
+from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig
+
+from rag_retriever import LocalContextRetriever, format_blocks
+from drugbot_prompts import SYSTEM_PROMPT, DEFAULT_BASE_MODEL
+from ie_client import IERetrievalClient
+
+try:
+    from peft import PeftModel
+except ImportError as exc:
+    raise ImportError(
+        "peft is required for adapter serving. Install it into the serving env "
+        "with: pip install peft"
+    ) from exc
+
+__all__ = [
+    "ServingConfig",
+    "GemmaRagEngine",
+    "build_generation_config",
+    "format_rag_messages",
+    "load_user_credentials",
+    "make_auth_callback",
+    "configure_logging",
+]
+
+LOGGER = logging.getLogger("gemma_serving")
+
+# The serving persona is the SAME system message the adapter was trained on (imported from the
+# shared module), presented as a real system role below. Keeping them identical stops the
+# adapter from being used out of the distribution it learned.
+DEFAULT_SYSTEM_INSTRUCTION = SYSTEM_PROMPT
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    if logging.getLogger().handlers:
+        LOGGER.setLevel(level)
+        return
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+@dataclass(frozen=True)
+class ServingConfig:
+    # RAG_BASE_MODEL is shared with training (drugbot_prompts.DEFAULT_BASE_MODEL): serving must
+    # load the same base the adapter was trained on, or PeftModel.from_pretrained will not attach.
+    base_model_id: str = os.environ.get("RAG_BASE_MODEL", DEFAULT_BASE_MODEL)
+    adapter_dir: str = os.environ.get("RAG_ADAPTER_DIR", "gemma-4-12b-drugbot-lora/")
+    device: str = os.environ.get("RAG_DEVICE", "cuda")
+    attn_implementation: str = os.environ.get("RAG_ATTN", "sdpa")
+    merge_adapter: bool = os.environ.get("RAG_MERGE_ADAPTER", "0") == "1"
+    max_new_tokens: int = int(os.environ.get("RAG_MAX_NEW_TOKENS", "512"))
+    temperature: float = float(os.environ.get("RAG_TEMPERATURE", "1.0"))
+    top_p: float = float(os.environ.get("RAG_TOP_P", "0.95"))
+    top_k: int = int(os.environ.get("RAG_TOP_K", "64"))
+    corpus_path: str = os.environ.get("RAG_CORPUS_PATH", "data/rag_corpus.jsonl")
+    index_path: str = os.environ.get("RAG_INDEX_PATH", "data/rag_index.faiss")
+    embedding_model: str = os.environ.get(
+        "RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+    )
+    retrieval_top_k: int = int(os.environ.get("RAG_RETRIEVAL_TOP_K", "4"))
+    context_block_chars: int = int(os.environ.get("RAG_CONTEXT_BLOCK_CHARS", "1400"))
+    retrieval_max_records: int = int(os.environ.get("RAG_RETRIEVAL_MAX_RECORDS", "0"))
+    # When set, refuse to silently fall back to lexical retrieval if the semantic
+    # index is missing or mismatched. Useful so a graded run fails loudly.
+    strict_retrieval: bool = os.environ.get("RAG_STRICT_RETRIEVAL", "0") == "1"
+    # Comma-separated extra directories to search for the PEFT adapter, tried after
+    # adapter_dir. Defaults cover a sibling Drug_research_bot checkout.
+    adapter_fallback_dirs: str = os.environ.get(
+        "RAG_ADAPTER_FALLBACK_DIRS", "../Drug_research_bot/gemma-4-12b-drugbot-lora"
+    )
+    # Intuition Engine concept/relation priors (optional). Empty endpoint => OFF, and the bot
+    # behaves exactly as FAISS-only. When set, priors are fetched fail-open (short timeout, never
+    # blocking) and merged ahead of the article blocks. See ie_client.IERetrievalClient.
+    ie_endpoint: str = os.environ.get("RAG_IE_ENDPOINT", "")
+    ie_namespace: str = os.environ.get("RAG_IE_NAMESPACE", "biomed")
+    ie_top_k: int = int(os.environ.get("RAG_IE_TOP_K", "3"))
+    ie_timeout_s: float = float(os.environ.get("RAG_IE_TIMEOUT_S", "1.5"))
+    ie_api_key: str = os.environ.get("RAG_IE_API_KEY", "")
+
+
+def build_generation_config(
+    base_generation_config: GenerationConfig, config: ServingConfig
+) -> GenerationConfig:
+    gen = GenerationConfig.from_dict(base_generation_config.to_dict())
+    gen.do_sample = True
+    gen.temperature = config.temperature
+    gen.top_p = config.top_p
+    gen.top_k = config.top_k
+    gen.max_new_tokens = config.max_new_tokens
+    if gen.pad_token_id is None and gen.eos_token_id is not None:
+        eos = gen.eos_token_id
+        gen.pad_token_id = eos if isinstance(eos, int) else eos[0]
+    return gen
+
+
+def format_rag_messages(
+    question: str,
+    context_blocks: Sequence[str],
+    system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION,
+) -> list[dict]:
+    if context_blocks:
+        context = "\n\n".join(
+            f"[{i + 1}] {block}" for i, block in enumerate(context_blocks)
+        )
+        # Exact training format (see qa_pairs_2024_v2.jsonl): system prompt, blank line,
+        # "Context:" with numbered blocks, blank line, "Question:". No extra instruction line
+        # here, or serving drifts off the distribution the adapter was trained on.
+        user_content = (
+            f"{system_instruction}\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {question}"
+        )
+    else:
+        user_content = (
+            f"{system_instruction}\n\n"
+            "No retrieval context was found. Answer only if the question can be handled "
+            "safely from general drug-information knowledge; otherwise say the local "
+            "corpus did not contain enough evidence.\n\n"
+            f"Question: {question}"
+        )
+    return [{"role": "user", "content": user_content}]
+
+
+class GemmaRagEngine:
+    """Gemma 4 + LoRA adapter with local retrieval to reduce context drift."""
+
+    def __init__(self, config: ServingConfig) -> None:
+        self.config = config
+        self.model = None
+        self.processor = None
+        self.retriever: LocalContextRetriever | None = None
+        self.generation_config: GenerationConfig | None = None
+        self.device = torch.device(config.device)
+        self.adapter_dir: str = config.adapter_dir
+        self.ie_client = IERetrievalClient(
+            endpoint=config.ie_endpoint,
+            namespace=config.ie_namespace,
+            top_k=config.ie_top_k,
+            timeout_s=config.ie_timeout_s,
+            api_key=config.ie_api_key,
+        )
+
+    def _adapter_candidates(self) -> list[str]:
+        candidates = [self.config.adapter_dir]
+        for extra in self.config.adapter_fallback_dirs.split(","):
+            extra = extra.strip()
+            if extra and extra not in candidates:
+                candidates.append(extra)
+        return candidates
+
+    def _resolve_adapter_dir(self) -> str:
+        """Pick the first candidate that holds a PEFT adapter, keeping env authoritative."""
+        for candidate in self._adapter_candidates():
+            if (Path(candidate) / "adapter_config.json").is_file():
+                if candidate != self.config.adapter_dir:
+                    LOGGER.info(
+                        "adapter not found at %s; using fallback %s",
+                        self.config.adapter_dir,
+                        candidate,
+                    )
+                return candidate
+        return self.config.adapter_dir
+
+    def load(self) -> "GemmaRagEngine":
+        self.adapter_dir = self._resolve_adapter_dir()
+        self._validate_environment()
+        self._load_retriever()
+        self._load_processor()
+        self._load_model()
+        self.generation_config = build_generation_config(
+            self.model.generation_config, self.config
+        )
+        LOGGER.info(
+            "Engine ready. base=%s adapter=%s device=%s dtype=%s attn=%s merged=%s retrieval=%s",
+            self.config.base_model_id,
+            self.adapter_dir,
+            self.device,
+            self.model.dtype,
+            self.config.attn_implementation,
+            self.config.merge_adapter,
+            bool(self.retriever),
+        )
+        return self
+
+    def _validate_environment(self) -> None:
+        if self.config.device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA requested but torch.cuda.is_available() is False. Check the "
+                "WSL2 GPU passthrough and that the torch build matches your driver."
+            )
+        adapter = Path(self.adapter_dir)
+        if not (adapter / "adapter_config.json").is_file():
+            tried = "\n  ".join(
+                str(Path(c).resolve()) for c in self._adapter_candidates()
+            )
+            raise FileNotFoundError(
+                f"No adapter_config.json found. Searched:\n  {tried}\n"
+                "PeftModel.from_pretrained needs a PEFT-format adapter directory "
+                "(adapter_config.json plus adapter_model.safetensors). Point "
+                "RAG_ADAPTER_DIR at the trained adapter, or add its path to "
+                "RAG_ADAPTER_FALLBACK_DIRS."
+            )
+
+    def _load_retriever(self) -> None:
+        corpus = Path(self.config.corpus_path)
+        if not corpus.is_file():
+            LOGGER.warning("RAG corpus not found at %s; starting without retrieval", corpus)
+            return
+        self.retriever = LocalContextRetriever(
+            corpus_path=corpus,
+            index_path=self.config.index_path,
+            embedding_model=self.config.embedding_model,
+            max_records=self.config.retrieval_max_records,
+            strict=self.config.strict_retrieval,
+        )
+
+    def _select_dtype(self) -> torch.dtype:
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+
+    def _device_map(self) -> dict | str:
+        if self.config.device.startswith("cuda"):
+            index = self.device.index if self.device.index is not None else 0
+            return {"": index}
+        return {"": "cpu"}
+
+    def _load_processor(self) -> None:
+        LOGGER.info("Loading processor for %s", self.config.base_model_id)
+        self.processor = AutoProcessor.from_pretrained(
+            self.config.base_model_id, padding_side="left"
+        )
+
+    def _load_model(self) -> None:
+        dtype = self._select_dtype()
+        LOGGER.info(
+            "Loading base model %s (dtype=%s, attn=%s)",
+            self.config.base_model_id,
+            dtype,
+            self.config.attn_implementation,
+        )
+        try:
+            base = AutoModelForCausalLM.from_pretrained(
+                self.config.base_model_id,
+                dtype=dtype,
+                attn_implementation=self.config.attn_implementation,
+                device_map=self._device_map(),
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(
+                "Out of memory loading the base model. Try the E4B variant instead of "
+                "12B, or enable 4-bit loading."
+            ) from exc
+
+        LOGGER.info("Attaching LoRA adapter from %s", self.adapter_dir)
+        try:
+            model = PeftModel.from_pretrained(base, self.adapter_dir)
+        except (KeyError, RuntimeError, ValueError) as exc:
+            raise RuntimeError(
+                "Failed to attach the LoRA adapter. A common cause is a module name "
+                "mismatch between the class used in Train_loRa.py and AutoModelForCausalLM. "
+                f"Original error: {exc}"
+            ) from exc
+
+        if self.config.merge_adapter:
+            LOGGER.info("Merging adapter into base weights for faster inference")
+            model = model.merge_and_unload()
+
+        model.eval()
+        self.model = model
+
+    def _fetch_ie_priors(self, question: str) -> list[str]:
+        """IE concept/relation priors as labeled blocks. Fail-open: [] if IE is off/unreachable."""
+        if not self.ie_client.enabled:
+            return []
+        priors = self.ie_client.fetch_priors(question)
+        if priors:
+            LOGGER.info("merged %d IE prior block(s) into context", len(priors))
+        return priors
+
+    def retrieve_context(self, question: str) -> list[str]:
+        """Assemble the numbered context: IE priors first (framing), then FAISS article blocks.
+
+        This is the single seam where external retrieval is merged. IE priors are labeled and
+        placed ahead of the articles; if IE is disabled or down, _fetch_ie_priors returns [] and
+        the result is identical to the FAISS-only bot.
+        """
+        ie_blocks = self._fetch_ie_priors(question)
+        faiss_blocks: list[str] = []
+        if self.retriever:
+            blocks = self.retriever.retrieve(question, top_k=self.config.retrieval_top_k)
+            faiss_blocks = format_blocks(blocks, max_chars=self.config.context_block_chars)
+        return ie_blocks + faiss_blocks
+
+    def answer(self, question: str, max_new_tokens: int | None = None) -> str:
+        context_blocks = self.retrieve_context(question)
+        messages = format_rag_messages(question=question, context_blocks=context_blocks)
+        return self.generate(messages, max_new_tokens=max_new_tokens)
+
+    @torch.inference_mode()
+    def generate(
+        self, messages: Sequence[dict], max_new_tokens: int | None = None
+    ) -> str:
+        if self.model is None or self.processor is None:
+            raise RuntimeError("Engine not loaded. Call load() before generate().")
+
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        # The chat-template string already begins with <bos> (Gemma templates emit bos_token),
+        # so tokenize with add_special_tokens=False to avoid prepending a SECOND <bos>, which
+        # shifts the input off-distribution and mismatches training.
+        inputs = self.processor(
+            text=text, return_tensors="pt", add_special_tokens=False
+        ).to(self.device)
+        input_len = inputs["input_ids"].shape[-1]
+
+        gen_config = self.generation_config
+        if max_new_tokens is not None:
+            gen_config = copy.deepcopy(gen_config)
+            gen_config.max_new_tokens = max_new_tokens
+
+        start = time.perf_counter()
+        try:
+            output = self.model.generate(**inputs, generation_config=gen_config)
+        except torch.cuda.OutOfMemoryError as exc:
+            torch.cuda.empty_cache()
+            raise RuntimeError(
+                "Out of memory during generation. Lower max_new_tokens or trim the "
+                "retrieved context size."
+            ) from exc
+
+        elapsed = time.perf_counter() - start
+        new_tokens = int(output.shape[-1] - input_len)
+        rate = new_tokens / elapsed if elapsed > 0 else 0.0
+        LOGGER.info("Generated %d tokens in %.2fs (%.1f tok/s)", new_tokens, elapsed, rate)
+
+        decode = getattr(self.processor, "decode", None) or self.processor.tokenizer.decode
+        answer = decode(output[0][input_len:], skip_special_tokens=True)
+        return answer.strip()
+
+
+def load_user_credentials(env_var: str = "RAG_CHATBOT_USERS") -> dict[str, str]:
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        LOGGER.warning(
+            "No %s set. Falling back to a single default account. Set %s before exposing.",
+            env_var,
+            env_var,
+        )
+        return {"capstone": "change-me"}
+
+    creds: dict[str, str] = {}
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        user, password = pair.split(":", 1)
+        user = user.strip()
+        if user:
+            creds[user] = password
+    if not creds:
+        raise ValueError(f"{env_var} was set but no valid user:pass pairs were parsed.")
+    return creds
+
+
+def make_auth_callback(credentials: dict[str, str]) -> Callable[[str, str], bool]:
+    def verify(username: str, password: str) -> bool:
+        expected = credentials.get(username)
+        if expected is None:
+            hmac.compare_digest(password, password)
+            return False
+        return hmac.compare_digest(password, expected)
+
+    return verify
+
+
+def build_demo(engine: GemmaRagEngine):
+    import gradio as gr
+
+    def respond(message: str, history: list) -> str:
+        # show_error=False hides tracebacks from users, so a raw exception here would stall the
+        # chat with no feedback. Log the real error and return a controlled message instead.
+        try:
+            return engine.answer(message)
+        except Exception:  # noqa: BLE001 -- a failed turn must not crash the UI
+            LOGGER.exception("generation failed for a chat turn")
+            return (
+                "Sorry, that request failed (the model may have run out of memory or the "
+                "question was too long). Try a shorter or more specific question."
+            )
+
+    return gr.ChatInterface(fn=respond, title="Drug Information RAG Chatbot")
+
+
+def main() -> None:
+    os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+    configure_logging()
+
+    engine = GemmaRagEngine(ServingConfig()).load()
+    demo = build_demo(engine)
+    credentials = load_user_credentials()
+
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("RAG_PORT", "7860")),
+        auth=make_auth_callback(credentials),
+        auth_message="CSC525 drug-information RAG chatbot. Authorized users only.",
+        share=False,
+        show_error=False,
+    )
+
+
+if __name__ == "__main__":
+    main()
+

@@ -1,31 +1,25 @@
-# Secrets / environment - NEVER commit
-.env
-.env.*
-*.key
-*.pem
-secrets.*
-
-# Python
+.venv/
 __pycache__/
 *.pyc
-.venv/
-venv/
-
-# Model weights / adapters (too big for git, regenerate from training)
-gemma-4-12b-drugbot-lora/
-*.safetensors
-*.npz
-
-# Embeddings / FAISS index (regenerate from corpus)
-rag_index/
-harvest_vectors.npy
-
-# Logs / HF cache / TB runs
 *.log
-.cache/
-runs/
+.env
+.env.*
 
-# OS / editor
-.DS_Store
-.idea/
-.vscode/
+# big corpora + FAISS indexes (regenerable, too large for git)
+data_full/
+data/rag_corpus_*.jsonl
+data/rag_index_*
+*.faiss
+*.npy
+
+# model + adapter/optimizer weights (artifacts)
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+gemma-*-lora*/
+
+# vendored source & snapshots
+bitsandbytes/
+_old_prod_*/
